@@ -86,13 +86,19 @@ final class Gemini implements Llm
                 'summary' => [
                     'type' => 'OBJECT',
                     'properties' => [
-                        'main_points' => ['type' => 'ARRAY', 'items' => ['type' => 'STRING']],
+                        'main_points' => [
+                            'type' => 'ARRAY',
+                            'items' => ['type' => 'STRING'],
+                            'minItems' => 1,
+                            'maxItems' => 7,
+                        ],
                         'short_summary' => ['type' => 'STRING'],
                     ],
                     'required' => ['main_points', 'short_summary'],
                 ],
                 'segments' => [
                     'type' => 'ARRAY',
+                    'minItems' => 1,
                     'items' => [
                         'type' => 'OBJECT',
                         'properties' => [
@@ -102,12 +108,16 @@ final class Gemini implements Llm
                             'segment_summary' => ['type' => 'STRING'],
                             'quiz' => [
                                 'type' => 'ARRAY',
+                                'minItems' => 1,
+                                'maxItems' => 3,
                                 'items' => [
                                     'type' => 'OBJECT',
                                     'properties' => [
                                         'question' => ['type' => 'STRING'],
                                         'options' => [
                                             'type' => 'ARRAY',
+                                            'minItems' => 4,
+                                            'maxItems' => 4,
                                             'items' => ['type' => 'STRING'],
                                         ],
                                         'correct_answer' => ['type' => 'STRING'],
@@ -136,7 +146,7 @@ final class Gemini implements Llm
             || !isset($result['summary']['main_points'], $result['summary']['short_summary'])
             || !is_array($result['summary']['main_points'])
             || !array_is_list($result['summary']['main_points'])
-            || count($result['summary']['main_points']) < 3
+            || count($result['summary']['main_points']) < 1
             || count($result['summary']['main_points']) > 7
             || array_filter($result['summary']['main_points'], static fn(mixed $point): bool => !is_string($point)) !== []
             || !is_string($result['summary']['short_summary'])) {
