@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+metrics*.json
+benchmark-*.json
+output*.json
+
+# PHP dependencies
+vendor/
+
+# Model weights / caches (Whisper, HuggingFace)
+*.bin
+*.pt
+*.safetensors
+
+# Audio/video test files (thường nặng, không nên commit)
+recordings/
+*.wav
+*.mp3
+*.mp4
+*.m4a

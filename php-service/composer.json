@@ -1,0 +1,13 @@
+{
+  "name": "record-to-quiz/php-service",
+  "description": "CLI upload and quiz generation pipeline",
+  "type": "project",
+  "require": {
+    "php": ">=8.1"
+  },
+  "autoload": {
+    "psr-4": {
+      "RecordToQuiz\\": "src/"
+    }
+  }
+}
