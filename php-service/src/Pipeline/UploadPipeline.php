@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace RecordToQuiz\Pipeline;
@@ -16,7 +17,8 @@ final class UploadPipeline
     public function run(array $files, bool $parallel = false, int $workers = 2, int $queueLimit = 8, ?Metrics $metrics = null): array
     {
         if ($parallel && !function_exists('pcntl_fork')) throw new PipelineException('Parallel mode requires pcntl (Linux/macOS/WSL).');
-        $metrics ??= new Metrics(); $metrics->start(count($files));
+        $metrics ??= new Metrics();
+        $metrics->start(count($files));
         $serviceLimit = max(1, (int) (getenv('WHISPER_MAX_CONCURRENCY') ?: 1));
         $workers = max(1, min($workers, $serviceLimit));
         $metrics->setWorkers($parallel ? min($workers, max(1, count($files))) : 1);
@@ -28,35 +30,91 @@ final class UploadPipeline
     private function one(string $file): array
     {
         $last = null;
-        $stageMetrics = ['vad' => 0.0, 'stt' => 0.0, 'llm' => 0.0];
-        $usage = ['input_tokens' => 0, 'output_tokens' => 0, 'api_calls' => 0, 'estimated_cost_usd' => 0.0];
+
+        $stageMetrics = [
+            'vad' => 0.0,
+            'stt' => 0.0,
+            'llm' => 0.0,
+        ];
+
+        $usage = [
+            'input_tokens' => 0,
+            'output_tokens' => 0,
+            'api_calls' => 0,
+            'estimated_cost_usd' => 0.0,
+        ];
+
         $retryCount = 0;
+
+        // VAD + Whisper chỉ chạy MỘT LẦN
+        try {
+            $transcription = $this->whisper->transcribeDetailed($file);
+
+            $transcript = $transcription['text'];
+
+            $stageMetrics['vad'] += $transcription['timings_ms']['vad'];
+            $stageMetrics['stt'] += $transcription['timings_ms']['stt'];
+        } catch (\Throwable $e) {
+            return [
+                'file' => $file,
+                'error' => $e->getMessage(),
+                '_metrics' => $stageMetrics,
+                '_llm_usage' => $usage,
+                '_retries' => 0,
+            ];
+        }
+
+        // Chỉ retry Gemini
         for ($attempt = 0; $attempt <= $this->retries; $attempt++) {
-            $llmAttempted = false;
+            $llmStarted = microtime(true);
+
             try {
-                $transcription = $this->whisper->transcribeDetailed($file);
-                $transcript = $transcription['text'];
-                $stageMetrics['vad'] += $transcription['timings_ms']['vad'];
-                $stageMetrics['stt'] += $transcription['timings_ms']['stt'];
-                $llmStarted = microtime(true);
-                $llmAttempted = true;
                 $quiz = $this->llm->generateQuiz($transcript);
-                $stageMetrics['llm'] += (microtime(true) - $llmStarted) * 1000;
-                $this->mergeUsage($usage, $this->llm->lastUsage());
-                return ['file' => $file, 'transcript' => $transcript, 'quiz' => $quiz, '_metrics' => $stageMetrics, '_llm_usage' => $usage, '_retries' => $retryCount];
+
+                $stageMetrics['llm'] +=
+                    (microtime(true) - $llmStarted) * 1000;
+
+                $this->mergeUsage(
+                    $usage,
+                    $this->llm->lastUsage()
+                );
+
+                return [
+                    'file' => $file,
+                    'transcript' => $transcript,
+                    'quiz' => $quiz,
+                    '_metrics' => $stageMetrics,
+                    '_llm_usage' => $usage,
+                    '_retries' => $retryCount,
+                ];
             } catch (\Throwable $e) {
                 $last = $e;
-                if ($llmAttempted) {
-                    $stageMetrics['llm'] += (microtime(true) - $llmStarted) * 1000;
-                    $this->mergeUsage($usage, $this->llm->lastUsage());
-                }
+
+                $stageMetrics['llm'] +=
+                    (microtime(true) - $llmStarted) * 1000;
+
+                $this->mergeUsage(
+                    $usage,
+                    $this->llm->lastUsage()
+                );
+
                 if ($attempt < $this->retries) {
                     $retryCount++;
-                    usleep(200000 * (1 << $attempt));
+
+                    usleep(
+                        200000 * (1 << $attempt)
+                    );
                 }
             }
         }
-        return ['file' => $file, 'error' => $last?->getMessage() ?? 'Unknown failure', '_metrics' => $stageMetrics, '_llm_usage' => $usage, '_retries' => $retryCount];
+
+        return [
+            'file' => $file,
+            'error' => $last?->getMessage() ?? 'Unknown failure',
+            '_metrics' => $stageMetrics,
+            '_llm_usage' => $usage,
+            '_retries' => $retryCount,
+        ];
     }
 
     private function sequential(array $files, Metrics $metrics): array
@@ -99,7 +157,8 @@ final class UploadPipeline
                     $encoded = json_encode($result, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE) . "\n";
                     $this->writeMessage($pair[1], $encoded, 'upload worker result');
                 }
-                fclose($pair[1]); exit(0);
+                fclose($pair[1]);
+                exit(0);
             }
             fclose($pair[1]);
             stream_set_blocking($pair[0], false);

@@ -1,10 +1,19 @@
 .venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .env
+
+# Generated application output
+transcription*.json
 metrics*.json
 benchmark-*.json
 output*.json
+*.log
 
 # PHP dependencies
 vendor/
@@ -20,3 +29,9 @@ recordings/
 *.mp3
 *.mp4
 *.m4a
+
+# Local editor / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

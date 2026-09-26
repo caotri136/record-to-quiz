@@ -20,7 +20,11 @@ You will receive:
 
 For the transcript as a whole:
 - Extract 3-7 main points (`main_points`) covering the entire lecture.
-- Write a short overall summary (`short_summary`), 2-4 sentences.
+- If the transcript is very short or contains limited educational content,
+  return as few as 1 main point. Never invent content merely to reach 3
+  main points.
+- Write a short overall summary (`short_summary`), normally 2-4 sentences.
+  For very short transcripts, 1 concise sentence is acceptable.
 
 For EACH segment (each 3-5 minute clip):
 - Write a concise segment summary (2-4 sentences, in Vietnamese, same
