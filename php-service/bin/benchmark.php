@@ -7,17 +7,13 @@ if (!$files) {
     exit(2);
 }
 $script = __DIR__ . '/record-to-quiz.php';
-$seqMetrics = getcwd() . DIRECTORY_SEPARATOR . 'benchmark-sequential.json';
-$parMetrics = getcwd() . DIRECTORY_SEPARATOR . 'benchmark-parallel.json';
+$metricsPath = getcwd() . DIRECTORY_SEPARATOR . 'benchmark-sequential.json';
 $quoted = implode(' ', array_map('escapeshellarg', $files));
-$commands = [
-    PHP_BINARY . ' ' . escapeshellarg($script) . ' --metrics=' . escapeshellarg($seqMetrics) . ' ' . $quoted,
-    PHP_BINARY . ' ' . escapeshellarg($script) . ' --parallel --metrics=' . escapeshellarg($parMetrics) . ' ' . $quoted,
-];
-foreach ($commands as $command) {
-    passthru($command, $status);
-    if ($status !== 0) exit($status);
+$command = PHP_BINARY . ' ' . escapeshellarg($script) .
+    ' --metrics=' . escapeshellarg($metricsPath) . ' ' . $quoted;
+passthru($command, $status);
+if ($status !== 0) {
+    exit($status);
 }
-$sequential = json_decode((string)file_get_contents($seqMetrics), true, 512, JSON_THROW_ON_ERROR);
-$parallel = json_decode((string)file_get_contents($parMetrics), true, 512, JSON_THROW_ON_ERROR);
-echo json_encode(['sequential' => $sequential, 'parallel' => $parallel], JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL;
+$metrics = json_decode((string) file_get_contents($metricsPath), true, 512, JSON_THROW_ON_ERROR);
+echo json_encode($metrics, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL;

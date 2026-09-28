@@ -23,11 +23,15 @@ logger = logging.getLogger("record_to_quiz.ml_service")
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.info(
-        "Whisper configuration selected: model=%s device=%s compute_type=%s",
+        "Loading Whisper model: model=%s device=%s compute_type=%s cpu_threads=%s",
         transcriber.model_name,
         transcriber.device,
         transcriber.compute_type,
+        transcriber.cpu_threads,
     )
+    load_started = time.perf_counter()
+    transcriber.load()
+    logger.info("Whisper model loaded in %.2fs", time.perf_counter() - load_started)
     yield
 
 
@@ -91,18 +95,18 @@ async def transcribe(request: Request, language: str = "vi") -> dict[str, Any]:
     """
     audio, _sample_rate = await read_audio_request(request)
     try:
-        vad_started = time.perf_counter()
-        chunks = vad.chunk(audio)
-        vad_ms = (time.perf_counter() - vad_started) * 1000
         stt_started = time.perf_counter()
-        results = [transcriber.transcribe(chunk.audio, language=language)
-                   for chunk in chunks]
+        result = transcriber.transcribe(audio, language=language)
         stt_ms = (time.perf_counter() - stt_started) * 1000
-        if not results:
-            raise ValueError("VAD found no speech in the audio")
-        return {"text": " ".join(item["text"] for item in results).strip(),
-                "timings_ms": {"vad": vad_ms, "stt": stt_ms},
-                "chunks": [{"start": chunk.start, "end": chunk.end, **result}
-                           for chunk, result in zip(chunks, results)]}
-    except (ValueError, VADError, WhisperError) as exc:
+        duration = len(audio) / _sample_rate
+        return {
+            "text": result["text"],
+            "timings_ms": {"vad": 0.0, "stt": stt_ms},
+            "chunks": [{
+                "start": 0.0,
+                "end": duration,
+                **result,
+            }],
+        }
+    except (ValueError, WhisperError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

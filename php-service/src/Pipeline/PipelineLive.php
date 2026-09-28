@@ -10,9 +10,8 @@ use RecordToQuiz\Support\Metrics;
 use RecordToQuiz\Support\PipelineException;
 
 /**
- * Replays an audio file in real time through FFmpeg to exercise the live
- * producer/consumer path. The FFmpeg capture is spooled to disk so VAD HTTP
- * latency cannot cause audio frames to be dropped.
+ * Replays an audio file in real time and transcribes finalized chunks in order.
+ * FFmpeg continues writing to the spool while the single PHP process handles STT.
  */
 final class PipelineLive
 {
@@ -28,30 +27,15 @@ final class PipelineLive
     }
 
     /** @return array<string, mixed> */
-    public function run(
-        string $audioFile,
-        int $requestedWorkers = 2,
-        int $queueLimit = 4,
-        ?Metrics $metrics = null,
-    ): array {
-        if (!function_exists('pcntl_fork')) {
-            throw new PipelineException('Live mode requires pcntl_fork (Linux/macOS/WSL2), unavailable in native Windows PHP.');
-        }
-        if (!function_exists('stream_socket_pair')) {
-            throw new PipelineException('Live mode requires Unix socketpair support.');
-        }
+    public function run(string $audioFile, ?Metrics $metrics = null): array
+    {
         if (!is_file($audioFile) || !is_readable($audioFile)) {
             throw new PipelineException("Audio file is missing or unreadable: $audioFile");
-        }
-        if ($requestedWorkers < 1 || $queueLimit < 1) {
-            throw new PipelineException('Worker count and queue limit must be positive integers.');
         }
 
         $metrics ??= new Metrics();
         $metrics->start(0);
-        $serviceConcurrency = max(1, (int) (getenv('WHISPER_MAX_CONCURRENCY') ?: 1));
-        $workerCount = min($requestedWorkers, $serviceConcurrency);
-        $metrics->setWorkers($workerCount);
+        $metrics->setWorkers(1);
 
         $rawPath = tempnam(sys_get_temp_dir(), 'rtq-live-raw-');
         $stderrPath = tempnam(sys_get_temp_dir(), 'rtq-live-err-');
@@ -66,19 +50,14 @@ final class PipelineLive
 
         $capture = null;
         $captureHandle = null;
-        $workerSockets = [];
-        $workerPids = [];
-        $workerBuffers = [];
-        $workerBusy = [];
-        $workerJobs = [];
-        $queue = [];
+        $rawInput = null;
+        $pendingFiles = [];
         $activePcm = '';
         $activeStart = 0.0;
         $elapsed = 0.0;
         $sequence = 0;
         $totalJobs = 0;
         $results = [];
-        $pendingFiles = [];
         $sourceFinished = false;
         $captureExitCode = null;
         $lastVadCheck = -INF;
@@ -86,14 +65,13 @@ final class PipelineLive
         $silenceSeconds = max(0.1, (float) (getenv('LIVE_SILENCE_SECONDS') ?: 0.8));
 
         try {
-            $this->startWorkers($workerCount, $workerSockets, $workerPids, $workerBuffers, $workerBusy, $workerJobs);
             $captureHandle = fopen($rawPath, 'wb');
             if ($captureHandle === false) {
-                throw new PipelineException('Unable to open the live audio spool file.');
+                throw new PipelineException('Unable to open the live audio spool.');
             }
             $stderrHandle = fopen($stderrPath, 'wb');
             if ($stderrHandle === false) {
-                throw new PipelineException('Unable to open FFmpeg diagnostics file.');
+                throw new PipelineException('Unable to open FFmpeg diagnostics.');
             }
             $capture = proc_open([
                 'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-re',
@@ -128,8 +106,7 @@ final class PipelineLive
                 $sourceFinished = !$captureStatus['running'] && $available === 0;
 
                 if ($available > 0 && ($available >= $frameBytes || !$captureStatus['running'])) {
-                    $readBytes = min($available, $frameBytes);
-                    $frame = fread($rawInput, $readBytes);
+                    $frame = fread($rawInput, min($available, $frameBytes));
                     if ($frame === false) {
                         throw new PipelineException('Unable to read captured audio data.');
                     }
@@ -139,7 +116,6 @@ final class PipelineLive
                         $elapsed = $readOffset / self::BYTES_PER_SECOND;
                     }
                 } else {
-                    $this->pollWorkers($workerSockets, $workerPids, $workerBuffers, $workerBusy, $workerJobs, $queue, $pendingFiles, $results, $metrics);
                     usleep(50_000);
                     continue;
                 }
@@ -148,14 +124,22 @@ final class PipelineLive
                 if ($duration >= 60.0 && $duration - $lastVadCheck >= $vadInterval) {
                     $lastVadCheck = $duration;
                     $intervals = $this->detectSpeech($activePcm, $pendingFiles, $metrics);
-                    $latestSpeechEnd = $intervals === [] ? null : (float) $intervals[array_key_last($intervals)]['end'];
+                    $latestSpeechEnd = $intervals === []
+                        ? null
+                        : (float) $intervals[array_key_last($intervals)]['end'];
                     if ($latestSpeechEnd !== null
                         && $latestSpeechEnd >= 60.0
                         && $duration - $latestSpeechEnd >= $silenceSeconds) {
-                        $this->cutAndQueue(
-                            $activePcm, $latestSpeechEnd, $activeStart, $sequence, $queue,
-                            $totalJobs, $workerSockets, $workerPids, $workerBuffers, $workerBusy,
-                            $workerJobs, $pendingFiles, $results, $metrics, $queueLimit
+                        $this->cutAndTranscribe(
+                            $activePcm,
+                            $latestSpeechEnd,
+                            $activeStart,
+                            $sequence,
+                            $totalJobs,
+                            $pendingFiles,
+                            $results,
+                            $metrics,
+                            true,
                         );
                         $activeStart += $latestSpeechEnd;
                         $lastVadCheck = -INF;
@@ -164,46 +148,53 @@ final class PipelineLive
 
                 $duration = strlen($activePcm) / self::BYTES_PER_SECOND;
                 if ($duration >= 75.0) {
-                    $this->cutAndQueue(
-                        $activePcm, 75.0, $activeStart, $sequence, $queue,
-                        $totalJobs, $workerSockets, $workerPids, $workerBuffers, $workerBusy,
-                        $workerJobs, $pendingFiles, $results, $metrics, $queueLimit
+                    $this->cutAndTranscribe(
+                        $activePcm,
+                        75.0,
+                        $activeStart,
+                        $sequence,
+                        $totalJobs,
+                        $pendingFiles,
+                        $results,
+                        $metrics,
                     );
                     $activeStart += 75.0;
                     $lastVadCheck = -INF;
                 }
-
-                $this->dispatchAvailable($queue, $workerSockets, $workerBusy, $workerJobs);
-                $this->pollWorkers($workerSockets, $workerPids, $workerBuffers, $workerBusy, $workerJobs, $queue, $pendingFiles, $results, $metrics);
             }
+
             fclose($rawInput);
             $rawInput = null;
+            $closeCode = proc_close($capture);
+            $capture = null;
+            if ($captureExitCode === null) {
+                $captureExitCode = $closeCode;
+            }
             if ($captureExitCode !== 0) {
                 $diagnostics = trim((string) file_get_contents($stderrPath));
-                throw new PipelineException('FFmpeg failed to decode the live input' . ($diagnostics !== '' ? ': ' . $diagnostics : '.'));
+                throw new PipelineException(
+                    'FFmpeg failed to decode the live input' .
+                    ($diagnostics !== '' ? ': ' . $diagnostics : '.')
+                );
             }
 
             if ($activePcm !== '') {
                 $intervals = $this->detectSpeech($activePcm, $pendingFiles, $metrics);
                 if ($intervals !== []) {
-                    $this->queuePcm($activePcm, $activeStart, $elapsed, $sequence, $queue, $totalJobs, $pendingFiles);
-                }
-            }
-            $metrics->setJobs($totalJobs);
-            $this->dispatchAvailable($queue, $workerSockets, $workerBusy, $workerJobs);
-            while ($queue !== [] || in_array(true, $workerBusy, true)) {
-                $this->dispatchAvailable($queue, $workerSockets, $workerBusy, $workerJobs);
-                $this->pollWorkers($workerSockets, $workerPids, $workerBuffers, $workerBusy, $workerJobs, $queue, $pendingFiles, $results, $metrics, 1.0);
-            }
-
-            usort($results, static fn(array $left, array $right): int => $left['sequence_number'] <=> $right['sequence_number']);
-            foreach ($results as $result) {
-                if (isset($result['error'])) {
-                    throw new PipelineException(
-                        'Transcription failed for chunk ' . $result['chunk_id'] . ': ' . $result['error']
+                    $this->transcribeChunk(
+                        $activePcm,
+                        $activeStart,
+                        $elapsed,
+                        ++$sequence,
+                        $totalJobs,
+                        $pendingFiles,
+                        $results,
+                        $metrics,
                     );
                 }
             }
+
+            $metrics->setJobs($totalJobs);
             $transcriptParts = [];
             foreach ($results as $result) {
                 $transcriptParts[] = sprintf(
@@ -217,11 +208,12 @@ final class PipelineLive
             if ($transcript === '') {
                 throw new PipelineException('VAD found no speech in the live recording.');
             }
-            $llmResult = $this->generateWithRetry($transcript, $metrics);
+
+            $quiz = $this->generateWithRetry($transcript, $metrics);
             $metrics->finish();
             return [
                 'transcript' => $transcript,
-                'quiz' => $llmResult,
+                'quiz' => $quiz,
                 'chunks' => $results,
                 'metrics' => $metrics->json(),
             ];
@@ -229,6 +221,9 @@ final class PipelineLive
             $metrics->finish();
             throw $error;
         } finally {
+            if (is_resource($rawInput)) {
+                fclose($rawInput);
+            }
             if (is_resource($captureHandle)) {
                 fclose($captureHandle);
             }
@@ -239,15 +234,6 @@ final class PipelineLive
                 }
                 proc_close($capture);
             }
-            foreach ($workerSockets as $socket) {
-                if (is_resource($socket)) {
-                    @fwrite($socket, "{\"stop\":true}\n");
-                    fclose($socket);
-                }
-            }
-            foreach ($workerPids as $pid) {
-                pcntl_waitpid($pid, $status);
-            }
             foreach (array_unique(array_merge([$rawPath, $stderrPath], $pendingFiles)) as $path) {
                 if (is_file($path)) {
                     unlink($path);
@@ -257,357 +243,109 @@ final class PipelineLive
     }
 
     /**
-     * @param array<int, resource> $sockets
-     * @param array<int, int> $pids
-     * @param array<int, string> $buffers
-     * @param array<int, bool> $busy
-     * @param array<int, array<string, mixed>|null> $jobs
-     */
-    private function startWorkers(int $count, array &$sockets, array &$pids, array &$buffers, array &$busy, array &$jobs): void
-    {
-        for ($worker = 0; $worker < $count; $worker++) {
-            $buffers[$worker] = '';
-            $busy[$worker] = false;
-            $jobs[$worker] = null;
-            $this->spawnWorker($worker, $sockets, $pids);
-        }
-    }
-
-    /** @param array<int, resource> $sockets
-     *  @param array<int, int> $pids
-     */
-    private function spawnWorker(int $worker, array &$sockets, array &$pids): void
-    {
-        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
-        if ($pair === false) {
-            throw new PipelineException('Unable to create worker IPC socket pair.');
-        }
-        $pid = pcntl_fork();
-        if ($pid === -1) {
-            fclose($pair[0]);
-            fclose($pair[1]);
-            throw new PipelineException('Unable to fork a live transcription worker.');
-        }
-        if ($pid === 0) {
-            fclose($pair[0]);
-            foreach ($sockets as $inheritedSocket) {
-                if (is_resource($inheritedSocket)) {
-                    fclose($inheritedSocket);
-                }
-            }
-            $this->workerLoop($pair[1]);
-        }
-        fclose($pair[1]);
-        stream_set_blocking($pair[0], false);
-        $sockets[$worker] = $pair[0];
-        $pids[$worker] = $pid;
-    }
-
-    /** @param resource $socket */
-    private function workerLoop($socket): never
-    {
-        while (($line = fgets($socket)) !== false) {
-            try {
-                $job = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
-                if (($job['stop'] ?? false) === true) {
-                    break;
-                }
-                $started = microtime(true);
-                $lastError = null;
-                $text = '';
-                $stageTimings = ['vad' => 0.0, 'stt' => 0.0];
-                try {
-                    $transcription = $this->whisper->transcribeDetailed((string) $job['path']);
-                    $text = $transcription['text'];
-                    $stageTimings = $transcription['timings_ms'];
-                } catch (\Throwable $error) {
-                    $lastError = $error->getMessage();
-                }
-                $message = [
-                    'chunk_id' => $job['chunk_id'],
-                    'sequence_number' => $job['sequence_number'],
-                    'start' => $job['start'],
-                    'end' => $job['end'],
-                    'text' => $text,
-                    'error' => $lastError,
-                    'timings_ms' => $stageTimings,
-                    'worker_duration_ms' => (microtime(true) - $started) * 1000,
-                ];
-            } catch (\Throwable $error) {
-                $message = ['error' => $error->getMessage(), 'fatal' => true];
-            }
-            $encoded = json_encode($message, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE) . "\n";
-            $offset = 0;
-            while ($offset < strlen($encoded)) {
-                $written = fwrite($socket, substr($encoded, $offset));
-                if ($written === false || $written === 0) {
-                    fclose($socket);
-                    exit(1);
-                }
-                $offset += $written;
-            }
-        }
-        fclose($socket);
-        exit(0);
-    }
-
-    /**
-     * @param array<int, resource> $sockets
-     * @param array<int, int> $pids
-     * @param array<int, string> $buffers
-     * @param array<int, bool> $busy
-     * @param array<int, array<string, mixed>|null> $jobs
-     * @param list<array<string, mixed>> $queue
      * @param list<string> $pendingFiles
-     * @param list<array<string, mixed>> $results
-     */
-    private function pollWorkers(
-        array &$sockets,
-        array &$pids,
-        array &$buffers,
-        array &$busy,
-        array &$jobs,
-        array &$queue,
-        array &$pendingFiles,
-        array &$results,
-        Metrics $metrics,
-        float $timeoutSeconds = 0.0,
-    ): void {
-        $read = array_values($sockets);
-        $write = null;
-        $except = null;
-        if ($read !== []) {
-            $seconds = (int) floor($timeoutSeconds);
-            $microseconds = (int) (($timeoutSeconds - $seconds) * 1_000_000);
-            $ready = @stream_select($read, $write, $except, $seconds, $microseconds);
-            if ($ready === false) {
-                throw new PipelineException('Failed while waiting for transcription worker responses.');
-            }
-            foreach ($read as $readySocket) {
-                $worker = array_search($readySocket, $sockets, true);
-                if ($worker === false) {
-                    continue;
-                }
-                $bytes = fread($readySocket, 65_536);
-                if ($bytes === false || ($bytes === '' && feof($readySocket))) {
-                    $this->recoverDeadWorker((int) $worker, $sockets, $pids, $buffers, $busy, $jobs, $queue, $pendingFiles, $results, $metrics);
-                    continue;
-                }
-                $buffers[$worker] .= $bytes;
-                while (($newline = strpos($buffers[$worker], "\n")) !== false) {
-                    $line = substr($buffers[$worker], 0, $newline);
-                    $buffers[$worker] = substr($buffers[$worker], $newline + 1);
-                    $message = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
-                    $job = $jobs[$worker];
-                    if ($job !== null) {
-                        $this->recordWorkerResult($message, $job, $queue, $pendingFiles, $results, $metrics);
-                    }
-                    $busy[$worker] = false;
-                    $jobs[$worker] = null;
-                }
-            }
-        } elseif ($timeoutSeconds > 0) {
-            usleep((int) ($timeoutSeconds * 1_000_000));
-        }
-        $this->dispatchAvailable($queue, $sockets, $busy, $jobs);
-    }
-
-    /**
-     * @param array<int, resource> $sockets
-     * @param array<int, bool> $busy
-     * @param array<int, array<string, mixed>|null> $jobs
-     * @param list<array<string, mixed>> $queue
-     */
-    private function dispatchAvailable(array &$queue, array &$sockets, array &$busy, array &$jobs): void
-    {
-        foreach ($sockets as $worker => $socket) {
-            if ($busy[$worker] || $queue === []) {
-                continue;
-            }
-            $job = array_shift($queue);
-            $line = json_encode($job, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE) . "\n";
-            $written = fwrite($socket, $line);
-            if ($written === false || $written !== strlen($line)) {
-                throw new PipelineException("Unable to send chunk {$job['chunk_id']} to worker $worker.");
-            }
-            $jobs[$worker] = $job;
-            $busy[$worker] = true;
-        }
-    }
-
-    /**
-     * @param array<string, mixed> $message
-     * @param array<string, mixed> $job
-     * @param list<array<string, mixed>> $queue
-     * @param list<string> $pendingFiles
-     * @param list<array<string, mixed>> $results
-     */
-    private function recordWorkerResult(array $message, array $job, array &$queue, array &$pendingFiles, array &$results, Metrics $metrics): void
-    {
-        if (!empty($message['error'])) {
-            $this->retryOrFail($job, (string) $message['error'], $queue, $pendingFiles, $results, $metrics);
-            return;
-        }
-        if (isset($job['path']) && is_file((string) $job['path'])) {
-            unlink((string) $job['path']);
-            $pendingFiles = array_values(array_filter($pendingFiles, static fn(string $path): bool => $path !== $job['path']));
-        }
-        foreach (($message['timings_ms'] ?? []) as $stage => $duration) {
-            $metrics->addStageTime((string) $stage, (float) $duration);
-        }
-        $metrics->success();
-        $results[] = [
-            'chunk_id' => (string) $job['chunk_id'],
-            'sequence_number' => (int) $job['sequence_number'],
-            'start' => (float) $job['start'],
-            'end' => (float) $job['end'],
-            'text' => (string) ($message['text'] ?? ''),
-        ];
-    }
-
-    /**
-     * @param array<string, mixed> $job
-     * @param list<array<string, mixed>> $queue
-     * @param list<string> $pendingFiles
-     * @param list<array<string, mixed>> $results
-     */
-    private function retryOrFail(array $job, string $error, array &$queue, array &$pendingFiles, array &$results, Metrics $metrics): void
-    {
-        $job['attempt'] = (int) ($job['attempt'] ?? 0) + 1;
-        if ($job['attempt'] <= $this->retries) {
-            $queue[] = $job;
-            $metrics->retry();
-            return;
-        }
-        $metrics->failure();
-        $results[] = [
-            'chunk_id' => (string) $job['chunk_id'],
-            'sequence_number' => (int) $job['sequence_number'],
-            'start' => (float) $job['start'],
-            'end' => (float) $job['end'],
-            'text' => '',
-            'error' => $error,
-        ];
-        if (is_file((string) $job['path'])) {
-            unlink((string) $job['path']);
-            $pendingFiles = array_values(array_filter($pendingFiles, static fn(string $path): bool => $path !== $job['path']));
-        }
-    }
-
-    /**
-     * @param array<int, resource> $sockets
-     * @param array<int, string> $buffers
-     * @param array<int, bool> $busy
-     * @param array<int, array<string, mixed>|null> $jobs
-     * @param list<array<string, mixed>> $queue
-     * @param list<string> $pendingFiles
-     */
-    private function recoverDeadWorker(
-        int $worker,
-        array &$sockets,
-        array &$pids,
-        array &$buffers,
-        array &$busy,
-        array &$jobs,
-        array &$queue,
-        array &$pendingFiles,
-        array &$results,
-        Metrics $metrics,
-    ): void {
-        $job = $jobs[$worker] ?? null;
-        if ($job !== null) {
-            $this->retryOrFail($job, 'Worker process exited unexpectedly.', $queue, $pendingFiles, $results, $metrics);
-        }
-        if (is_resource($sockets[$worker] ?? null)) {
-            fclose($sockets[$worker]);
-        }
-        if (isset($pids[$worker])) {
-            pcntl_waitpid($pids[$worker], $status, WNOHANG);
-        }
-        unset($sockets[$worker]);
-        $buffers[$worker] = '';
-        $busy[$worker] = false;
-        $jobs[$worker] = null;
-        $this->spawnWorker($worker, $sockets, $pids);
-    }
-
-    /** @param list<string> $pendingFiles
-     *  @return list<array{start: float, end: float}>
+     * @return list<array{start: float, end: float}>
      */
     private function detectSpeech(string $pcm, array &$pendingFiles, Metrics $metrics): array
     {
         $path = $this->writeWave($pcm, $pendingFiles);
         $started = microtime(true);
         try {
-            $intervals = $this->vad->segments($path);
-            $metrics->addStageTime('vad', (microtime(true) - $started) * 1000);
-            return $intervals;
-        } catch (\Throwable $error) {
-            $metrics->addStageTime('vad', (microtime(true) - $started) * 1000);
-            throw $error;
+            return $this->vad->segments($path);
         } finally {
-            if (is_file($path)) {
-                unlink($path);
-                $pendingFiles = array_values(array_filter($pendingFiles, static fn(string $item): bool => $item !== $path));
-            }
+            $metrics->addStageTime('vad', (microtime(true) - $started) * 1000);
+            $this->removeTemporaryFile($path, $pendingFiles);
         }
     }
 
     /**
      * @param list<string> $pendingFiles
-     * @param list<array<string, mixed>> $queue
+     * @param list<array<string, mixed>> $results
      */
-    private function cutAndQueue(
+    private function cutAndTranscribe(
         string &$pcm,
         float $cutSeconds,
         float $startSeconds,
         int &$sequence,
-        array &$queue,
         int &$totalJobs,
-        array &$sockets,
-        array &$pids,
-        array &$buffers,
-        array &$busy,
-        array &$jobs,
         array &$pendingFiles,
         array &$results,
         Metrics $metrics,
-        int $queueLimit,
+        bool $speechAlreadyDetected = false,
     ): void {
-        $cutBytes = min(strlen($pcm), (int) floor($cutSeconds * self::BYTES_PER_SECOND / 2) * 2);
+        $cutBytes = min(strlen($pcm), (int) floor($cutSeconds * self::BYTES_PER_SECOND));
+        $cutBytes -= $cutBytes % 2;
         if ($cutBytes <= 0) {
             return;
         }
         $chunkPcm = substr($pcm, 0, $cutBytes);
         $pcm = substr($pcm, $cutBytes);
         $endSeconds = $startSeconds + ($cutBytes / self::BYTES_PER_SECOND);
-        $speech = $this->detectSpeech($chunkPcm, $pendingFiles, $metrics);
-        if ($speech !== []) {
-            $this->queuePcm($chunkPcm, $startSeconds, $endSeconds, $sequence, $queue, $totalJobs, $pendingFiles);
-        }
-        $this->dispatchAvailable($queue, $sockets, $busy, $jobs);
-        while (count($queue) >= $queueLimit) {
-            $this->pollWorkers($sockets, $pids, $buffers, $busy, $jobs, $queue, $pendingFiles, $results, $metrics, 0.25);
+        if ($speechAlreadyDetected || $this->detectSpeech($chunkPcm, $pendingFiles, $metrics) !== []) {
+            $this->transcribeChunk(
+                $chunkPcm,
+                $startSeconds,
+                $endSeconds,
+                ++$sequence,
+                $totalJobs,
+                $pendingFiles,
+                $results,
+                $metrics,
+            );
         }
     }
 
     /**
-     * @param list<array<string, mixed>> $queue
      * @param list<string> $pendingFiles
+     * @param list<array<string, mixed>> $results
      */
-    private function queuePcm(string $pcm, float $start, float $end, int &$sequence, array &$queue, int &$totalJobs, array &$pendingFiles): void
-    {
+    private function transcribeChunk(
+        string $pcm,
+        float $start,
+        float $end,
+        int $sequence,
+        int &$totalJobs,
+        array &$pendingFiles,
+        array &$results,
+        Metrics $metrics,
+    ): void {
         $path = $this->writeWave($pcm, $pendingFiles);
-        $sequence++;
         $totalJobs++;
-        $queue[] = [
-            'chunk_id' => sprintf('chunk-%06d', $sequence),
-            'sequence_number' => $sequence,
-            'start' => $start,
-            'end' => $end,
-            'path' => $path,
-            'attempt' => 0,
-        ];
+        $lastError = null;
+        try {
+            for ($attempt = 0; $attempt <= $this->retries; $attempt++) {
+                $started = microtime(true);
+                try {
+                    $transcription = $this->whisper->transcribeDetailed($path);
+                    $metrics->addStageTime('stt', (microtime(true) - $started) * 1000);
+                    $metrics->success();
+                    $results[] = [
+                        'chunk_id' => sprintf('chunk-%06d', $sequence),
+                        'sequence_number' => $sequence,
+                        'start' => $start,
+                        'end' => $end,
+                        'text' => $transcription['text'],
+                    ];
+                    return;
+                } catch (\Throwable $error) {
+                    $metrics->addStageTime('stt', (microtime(true) - $started) * 1000);
+                    $lastError = $error;
+                    if ($attempt < $this->retries) {
+                        $metrics->retry();
+                        usleep(200_000 * (1 << $attempt));
+                    }
+                }
+            }
+            $metrics->failure();
+            throw new PipelineException(
+                'Transcription failed for chunk ' . sprintf('chunk-%06d', $sequence) .
+                ': ' . ($lastError?->getMessage() ?? 'unknown error'),
+                0,
+                $lastError,
+            );
+        } finally {
+            $this->removeTemporaryFile($path, $pendingFiles);
+        }
     }
 
     /** @param list<string> $pendingFiles */
@@ -618,13 +356,27 @@ final class PipelineLive
             throw new PipelineException('Unable to create a temporary audio chunk.');
         }
         $length = strlen($pcm);
-        $wave = 'RIFF' . pack('V', 36 + $length) . 'WAVEfmt ' . pack('VvvVVvv', 16, 1, 1, self::SAMPLE_RATE, self::BYTES_PER_SECOND, 2, 16) . 'data' . pack('V', $length) . $pcm;
+        $wave = 'RIFF' . pack('V', 36 + $length) . 'WAVEfmt ' .
+            pack('VvvVVvv', 16, 1, 1, self::SAMPLE_RATE, self::BYTES_PER_SECOND, 2, 16) .
+            'data' . pack('V', $length) . $pcm;
         if (file_put_contents($path, $wave) === false) {
             unlink($path);
             throw new PipelineException('Unable to write a temporary audio chunk.');
         }
         $pendingFiles[] = $path;
         return $path;
+    }
+
+    /** @param list<string> $pendingFiles */
+    private function removeTemporaryFile(string $path, array &$pendingFiles): void
+    {
+        if (is_file($path) && !unlink($path)) {
+            throw new PipelineException("Unable to remove temporary audio file: $path");
+        }
+        $pendingFiles = array_values(array_filter(
+            $pendingFiles,
+            static fn(string $pendingPath): bool => $pendingPath !== $path,
+        ));
     }
 
     private function generateWithRetry(string $transcript, Metrics $metrics): array
@@ -647,7 +399,11 @@ final class PipelineLive
                 }
             }
         }
-        throw new PipelineException('LLM generation failed after retries: ' . ($lastError?->getMessage() ?? 'unknown error'), previous: $lastError);
+        throw new PipelineException(
+            'LLM generation failed after retries: ' . ($lastError?->getMessage() ?? 'unknown error'),
+            0,
+            $lastError,
+        );
     }
 
     private static function formatTime(float $seconds): string

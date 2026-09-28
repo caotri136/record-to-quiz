@@ -21,15 +21,18 @@ spl_autoload_register(static function (string $class): void {
 
 $opts = [];
 $files = [];
-$valueOptions = ['workers', 'queue', 'retries', 'metrics', 'output'];
+$valueOptions = ['retries', 'metrics', 'output'];
 for ($index = 1; $index < $argc; $index++) {
     $argument = $argv[$index];
     if ($argument === '--help') {
         $opts['help'] = true;
         continue;
     }
-    if ($argument === '--live' || $argument === '--parallel') {
-        $opts[substr($argument, 2)] = true;
+    if ($argument === '--parallel') {
+        throw new InvalidArgumentException('Parallel mode has been removed; files are processed sequentially.');
+    }
+    if ($argument === '--live') {
+        $opts['live'] = true;
         continue;
     }
     if (str_starts_with($argument, '--')) {
@@ -50,11 +53,8 @@ for ($index = 1; $index < $argc; $index++) {
     $files[] = $argument;
 }
 if (isset($opts['help']) || $files === []) {
-    fwrite(STDERR, "Usage: record-to-quiz.php [--live] [--parallel] [--workers=N] [--queue=N] [--metrics=FILE] AUDIO...\n");
+    fwrite(STDERR, "Usage: record-to-quiz.php [--live] [--retries=N] [--metrics=FILE] [--output=FILE] AUDIO...\n");
     exit($files === [] && !isset($opts['help']) ? 2 : 0);
-}
-if (isset($opts['live'], $opts['parallel'])) {
-    throw new InvalidArgumentException('Choose either --live or --parallel, not both.');
 }
 $http = new HttpClient();
 $serviceUrl = Config::env('WHISPER_URL', 'http://127.0.0.1:8000');
@@ -62,15 +62,13 @@ $whisper = new WhisperClient($http, $serviceUrl);
 $llm = new Gemini(Config::env('GEMINI_API_KEY'), dirname(__DIR__) . '/skills/skill.md', Config::env('GEMINI_MODEL', 'gemini-1.5-flash'));
 $metrics = new Metrics();
 $retries = (int) ($opts['retries'] ?? 2);
-$workers = (int) ($opts['workers'] ?? 2);
-$queueLimit = (int) ($opts['queue'] ?? 8);
 if (isset($opts['live'])) {
     if (count($files) !== 1) {
         throw new InvalidArgumentException('Live simulation expects exactly one input audio/video file.');
     }
     $pipeline = new PipelineLive(new VadClient($http, $serviceUrl), $whisper, $llm, $retries);
     try {
-        $result = $pipeline->run($files[0], $workers, $queueLimit, $metrics);
+        $result = $pipeline->run($files[0], $metrics);
     } catch (Throwable $error) {
         if (isset($opts['metrics'])) $metrics->write((string) $opts['metrics']);
         fwrite(STDERR, 'Pipeline failed: ' . $error->getMessage() . PHP_EOL);
@@ -79,7 +77,7 @@ if (isset($opts['live'])) {
 } else {
     $pipeline = new UploadPipeline($whisper, $llm, $retries);
     try {
-        $result = $pipeline->run($files, isset($opts['parallel']), $workers, $queueLimit, $metrics);
+        $result = $pipeline->run($files, $metrics);
     } catch (Throwable $error) {
         if (isset($opts['metrics'])) $metrics->write((string) $opts['metrics']);
         fwrite(STDERR, 'Pipeline failed: ' . $error->getMessage() . PHP_EOL);

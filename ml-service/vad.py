@@ -1,29 +1,14 @@
-"""Silero VAD and bounded audio chunking.
-
-The chunker prefers boundaries near 60 seconds, but never emits a chunk longer
-than 75 seconds.  It is deliberately independent of an audio file decoder:
-callers provide a mono, float32 waveform.
-"""
+"""Silero VAD wrapper for mono, float32 audio."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 
 
 class VADError(RuntimeError):
     """Raised when the VAD cannot be loaded or used."""
-
-
-@dataclass(frozen=True)
-class AudioChunk:
-    """A bounded section of audio and its position in the source."""
-
-    audio: np.ndarray
-    start: float
-    end: float
 
 
 class SileroVAD:
@@ -72,57 +57,3 @@ class SileroVAD:
              float(item["end"]) / self.sampling_rate)
             for item in result
         ]
-
-    def chunk(self, audio: np.ndarray, *, soft_limit: float = 60.0,
-              hard_limit: float = 75.0) -> list[AudioChunk]:
-        """Split audio at VAD silence, with soft and hard duration limits."""
-        if soft_limit <= 0 or hard_limit < soft_limit:
-            raise ValueError("hard_limit must be >= a positive soft_limit")
-        waveform = np.asarray(audio, dtype=np.float32)
-        speech = self.speech_timestamps(waveform)
-        if not speech:
-            return []
-        return split_audio_chunks(waveform, self.sampling_rate, speech,
-                                  soft_limit=soft_limit, hard_limit=hard_limit)
-
-
-def split_audio_chunks(
-    audio: np.ndarray, sampling_rate: int, speech: Iterable[tuple[float, float]],
-    *, soft_limit: float = 60.0, hard_limit: float = 75.0,
-) -> list[AudioChunk]:
-    """Build chunks from speech intervals.
-
-    A silence boundary closest to the 60s target is selected when possible.
-    Long uninterrupted speech is cut at exactly the 75s hard limit.
-    """
-    intervals = sorted((max(0.0, start), max(start, end))
-                       for start, end in speech if end > start)
-    if not intervals:
-        return []
-    chunks: list[AudioChunk] = []
-    cursor = intervals[0][0]
-    interval_index = 0
-    total = len(audio) / sampling_rate
-    while cursor < intervals[-1][1]:
-        limit = min(cursor + hard_limit, total)
-        target = min(cursor + soft_limit, limit)
-        candidates: list[float] = []
-        for index in range(interval_index, len(intervals)):
-            start, end = intervals[index]
-            if start >= cursor and start <= limit:
-                candidates.append(start)
-            if end > cursor and end <= limit:
-                candidates.append(end)
-        boundary = min(candidates, key=lambda value: abs(value - target)) if candidates else limit
-        if boundary <= cursor:
-            boundary = limit
-        start_sample = int(round(cursor * sampling_rate))
-        end_sample = min(len(audio), int(round(boundary * sampling_rate)))
-        chunks.append(AudioChunk(audio=audio[start_sample:end_sample].copy(),
-                                 start=cursor, end=boundary))
-        cursor = boundary
-        while interval_index < len(intervals) and intervals[interval_index][1] <= cursor:
-            interval_index += 1
-        while interval_index < len(intervals) and intervals[interval_index][0] < cursor:
-            interval_index += 1
-    return chunks
