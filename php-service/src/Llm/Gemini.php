@@ -7,6 +7,9 @@ use RecordToQuiz\Support\HttpException;
 
 final class Gemini implements Llm
 {
+    private const WORDS_PER_MINUTE = 140;
+    private const WORDS_PER_SEGMENT = 560;
+
     private string $skill;
     /** @var array{input_tokens: int, output_tokens: int, api_calls: int, estimated_cost_usd: float|null} */
     private array $usage = [
@@ -16,13 +19,27 @@ final class Gemini implements Llm
         'estimated_cost_usd' => null,
     ];
 
-    public function __construct(private readonly string $apiKey, string $skillPath, private readonly string $model = 'gemini-1.5-flash')
+    public function __construct(private readonly string $apiKey, string $skillPath, private readonly string $model = 'gemini-3.1-flash-lite')
     {
         $this->skill = file_get_contents($skillPath) ?: throw new \InvalidArgumentException("Cannot read skill file: $skillPath");
     }
 
-    public function generateQuiz(string $transcript): array
+    public function generateQuiz(string $transcript, ?float $durationSeconds = null): array
     {
+        $sourceSegments = $this->segmentTranscript($transcript, $durationSeconds);
+        $segmentedTranscript = sprintf(
+            "This transcript has %d consecutive source segments. Return exactly one quiz segment for each source segment, in the same order. Do not omit, merge, or split source segments. Preserve their timestamps.\n\n",
+            count($sourceSegments),
+        );
+        foreach ($sourceSegments as $segment) {
+            $segmentedTranscript .= sprintf(
+                "[%s - %s] %s\n",
+                $segment['start_time'],
+                $segment['end_time'],
+                $segment['text'],
+            );
+        }
+
         $this->usage = [
             'input_tokens' => 0,
             'output_tokens' => 0,
@@ -32,7 +49,7 @@ final class Gemini implements Llm
         $url = "https://generativelanguage.googleapis.com/v1beta/models/{$this->model}:generateContent?key=" . rawurlencode($this->apiKey);
         $payload = json_encode([
             'systemInstruction' => ['parts' => [['text' => $this->skill]]],
-            'contents' => [['parts' => [['text' => "Transcript:\n" . $transcript]]]],
+            'contents' => [['parts' => [['text' => "Transcript:\n" . $segmentedTranscript]]]],
             'generationConfig' => [
                 'responseMimeType' => 'application/json',
                 'responseSchema' => self::responseSchema(),
@@ -68,7 +85,11 @@ final class Gemini implements Llm
         $text = preg_replace('/^```(?:json)?\s*|\s*```$/i', '', trim($text)) ?? $text;
         $result = json_decode($text, true, 512, JSON_THROW_ON_ERROR);
         if (!is_array($result)) throw new HttpException('Gemini returned non-object JSON.');
-        $this->validateResult($result);
+        $this->validateResult($result, count($sourceSegments));
+        foreach ($sourceSegments as $index => $segment) {
+            $result['segments'][$index]['start_time'] = $segment['start_time'];
+            $result['segments'][$index]['end_time'] = $segment['end_time'];
+        }
         return $result;
     }
 
@@ -108,7 +129,7 @@ final class Gemini implements Llm
                             'segment_summary' => ['type' => 'STRING'],
                             'quiz' => [
                                 'type' => 'ARRAY',
-                                'minItems' => 1,
+                                'minItems' => 3,
                                 'maxItems' => 3,
                                 'items' => [
                                     'type' => 'OBJECT',
@@ -135,8 +156,77 @@ final class Gemini implements Llm
         ];
     }
 
+    /** @return list<array{text: string, start_time: string, end_time: string}> */
+    private function segmentTranscript(string $transcript, ?float $durationSeconds = null): array
+    {
+        $transcript = trim($transcript);
+        if ($transcript === '') {
+            throw new HttpException('Cannot generate a quiz from an empty transcript.');
+        }
+
+        $sentences = preg_split('/(?<=[.!?])\s+/u', $transcript, -1, PREG_SPLIT_NO_EMPTY);
+        if ($sentences === false || $sentences === []) {
+            $sentences = [$transcript];
+        }
+
+        $pieces = [];
+        foreach ($sentences as $sentence) {
+            $words = preg_split('/\s+/u', trim($sentence), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            foreach (array_chunk($words, self::WORDS_PER_SEGMENT) as $wordChunk) {
+                if ($wordChunk !== []) {
+                    $pieces[] = implode(' ', $wordChunk);
+                }
+            }
+        }
+
+        $textSegments = [];
+        $currentText = [];
+        $currentWordCount = 0;
+        foreach ($pieces as $piece) {
+            $pieceWordCount = count(preg_split('/\s+/u', $piece, -1, PREG_SPLIT_NO_EMPTY) ?: []);
+            if ($currentWordCount > 0 && $currentWordCount + $pieceWordCount > self::WORDS_PER_SEGMENT) {
+                $textSegments[] = ['text' => implode(' ', $currentText), 'word_count' => $currentWordCount];
+                $currentText = [];
+                $currentWordCount = 0;
+            }
+            $currentText[] = $piece;
+            $currentWordCount += $pieceWordCount;
+        }
+        if ($currentWordCount > 0) {
+            $textSegments[] = ['text' => implode(' ', $currentText), 'word_count' => $currentWordCount];
+        }
+
+        $totalWords = array_sum(array_column($textSegments, 'word_count'));
+        $totalDuration = $durationSeconds !== null && $durationSeconds > 0
+            ? $durationSeconds
+            : $totalWords * 60 / self::WORDS_PER_MINUTE;
+        $segments = [];
+        $elapsedWords = 0;
+        foreach ($textSegments as $segment) {
+            $startSeconds = (int) round($elapsedWords * $totalDuration / $totalWords);
+            $elapsedWords += $segment['word_count'];
+            $endSeconds = (int) round($elapsedWords * $totalDuration / $totalWords);
+            $segments[] = [
+                'text' => $segment['text'],
+                'start_time' => self::formatDuration($startSeconds),
+                'end_time' => self::formatDuration($endSeconds),
+            ];
+        }
+        return $segments;
+    }
+
+    private static function formatDuration(int $seconds): string
+    {
+        return sprintf(
+            '%02d:%02d:%02d',
+            intdiv($seconds, 3600),
+            intdiv($seconds % 3600, 60),
+            $seconds % 60,
+        );
+    }
+
     /** @param array<string, mixed> $result */
-    private function validateResult(array $result): void
+    private function validateResult(array $result, int $expectedSegmentCount): void
     {
         if (array_diff(array_keys($result), ['summary', 'segments']) !== []
             || !isset($result['summary'], $result['segments'])
@@ -156,6 +246,13 @@ final class Gemini implements Llm
         if (!array_is_list($result['segments']) || $result['segments'] === []) {
             throw new HttpException('Gemini returned no ordered segments.');
         }
+        if (count($result['segments']) !== $expectedSegmentCount) {
+            throw new HttpException(sprintf(
+                'Gemini returned %d quiz segments for %d transcript segments.',
+                count($result['segments']),
+                $expectedSegmentCount,
+            ));
+        }
         foreach ($result['segments'] as $index => $segment) {
             if (!is_array($segment)
                 || array_diff(array_keys($segment), ['segment_index', 'start_time', 'end_time', 'segment_summary', 'quiz']) !== []
@@ -168,8 +265,7 @@ final class Gemini implements Llm
                 || !is_string($segment['segment_summary'] ?? null)
                 || !is_array($segment['quiz'] ?? null)
                 || !array_is_list($segment['quiz'])
-                || $segment['quiz'] === []
-                || count($segment['quiz']) > 3) {
+                || count($segment['quiz']) !== 3) {
                 throw new HttpException('Gemini returned a segment that does not match the required schema.');
             }
             foreach ($segment['quiz'] as $question) {

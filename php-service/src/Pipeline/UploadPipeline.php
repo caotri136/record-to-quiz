@@ -46,13 +46,17 @@ final class UploadPipeline
             'estimated_cost_usd' => 0.0,
         ];
         $retryCount = 0;
+        $transcriptDurationSeconds = null;
 
+        $sttStarted = microtime(true);
         try {
             $transcription = $this->whisper->transcribeDetailed($file);
             $transcript = $transcription['text'];
+            $transcriptDurationSeconds = $transcription['duration_seconds'];
             $stageMetrics['vad'] += $transcription['timings_ms']['vad'];
             $stageMetrics['stt'] += $transcription['timings_ms']['stt'];
         } catch (\Throwable $error) {
+            $stageMetrics['stt'] += (microtime(true) - $sttStarted) * 1000;
             return [
                 'file' => $file,
                 'error' => $error->getMessage(),
@@ -66,7 +70,7 @@ final class UploadPipeline
         for ($attempt = 0; $attempt <= $this->retries; $attempt++) {
             $started = microtime(true);
             try {
-                $quiz = $this->llm->generateQuiz($transcript);
+                $quiz = $this->llm->generateQuiz($transcript, $transcriptDurationSeconds);
                 $stageMetrics['llm'] += (microtime(true) - $started) * 1000;
                 $this->mergeUsage($usage, $this->llm->lastUsage());
                 return [

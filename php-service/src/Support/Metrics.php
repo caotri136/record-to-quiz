@@ -9,12 +9,15 @@ final class Metrics
     private array $data = [
         'started_at' => null,
         'finished_at' => null,
+        'started_at_epoch' => null,
+        'finished_at_epoch' => null,
         'jobs' => 0,
         'successes' => 0,
         'failures' => 0,
         'retries' => 0,
         'workers' => 1,
         'duration_ms' => 0.0,
+        'processing_time_seconds' => ['stt' => 0.0, 'gemini' => 0.0, 'total' => 0.0],
         'stage_timings_ms' => ['vad' => 0.0, 'stt' => 0.0, 'llm' => 0.0],
         'llm' => [
             'api_calls' => 0,
@@ -24,17 +27,27 @@ final class Metrics
         ],
     ];
 
+    private float $startedAtEpoch = 0.0;
+
     public function start(int $jobs): void
     {
-        $this->data['started_at'] = microtime(true);
+        $this->startedAtEpoch = microtime(true);
+        $this->data['started_at'] = self::formatTimestamp($this->startedAtEpoch);
+        $this->data['started_at_epoch'] = $this->startedAtEpoch;
         $this->data['jobs'] = $jobs;
     }
 
     public function finish(): void
     {
-        $this->data['finished_at'] = microtime(true);
-        $this->data['duration_ms'] =
-            ((float) $this->data['finished_at'] - (float) $this->data['started_at']) * 1000;
+        $finishedAtEpoch = microtime(true);
+        $this->data['finished_at'] = self::formatTimestamp($finishedAtEpoch);
+        $this->data['finished_at_epoch'] = $finishedAtEpoch;
+        $this->data['duration_ms'] = ($finishedAtEpoch - $this->startedAtEpoch) * 1000;
+        $this->data['processing_time_seconds'] = [
+            'stt' => round($this->data['stage_timings_ms']['stt'] / 1000, 3),
+            'gemini' => round($this->data['stage_timings_ms']['llm'] / 1000, 3),
+            'total' => round($this->data['duration_ms'] / 1000, 3),
+        ];
     }
 
     public function addStageTime(string $stage, float $durationMs): void
@@ -97,5 +110,16 @@ final class Metrics
         if (file_put_contents($path, $json . PHP_EOL) === false) {
             throw new \RuntimeException("Cannot write metrics: $path");
         }
+    }
+
+    private static function formatTimestamp(float $timestamp): string
+    {
+        $date = \DateTimeImmutable::createFromFormat('U.u', number_format($timestamp, 6, '.', ''));
+        if ($date === false) {
+            throw new \RuntimeException('Unable to format metrics timestamp.');
+        }
+        return $date
+            ->setTimezone(new \DateTimeZone(date_default_timezone_get()))
+            ->format('Y-m-d\TH:i:s.uP');
     }
 }

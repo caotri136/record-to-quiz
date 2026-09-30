@@ -1,0 +1,30 @@
+{
+    "results": [
+        {
+            "file": "..\/recordings\/sample-20s.wav",
+            "error": "Gemini request failed (404): ",
+            "_retries": 2
+        }
+    ],
+    "metrics": {
+        "started_at": 1790592554.312981,
+        "finished_at": 1790592558.671252,
+        "jobs": 1,
+        "successes": 0,
+        "failures": 1,
+        "retries": 2,
+        "workers": 1,
+        "duration_ms": 4358.27112197876,
+        "stage_timings_ms": {
+            "vad": 0,
+            "stt": 2348.9477279999846,
+            "llm": 1381.2332153320312
+        },
+        "llm": {
+            "api_calls": 3,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_cost_usd": null
+        }
+    }
+}

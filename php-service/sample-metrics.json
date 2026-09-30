@@ -1,0 +1,21 @@
+{
+    "started_at": 1790592129.503531,
+    "finished_at": 1790592255.691825,
+    "jobs": 1,
+    "successes": 0,
+    "failures": 1,
+    "retries": 0,
+    "workers": 1,
+    "duration_ms": 126188.29393386841,
+    "stage_timings_ms": {
+        "vad": 0,
+        "stt": 0,
+        "llm": 0
+    },
+    "llm": {
+        "api_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost_usd": 0
+    }
+}

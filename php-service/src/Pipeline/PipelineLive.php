@@ -326,6 +326,14 @@ final class PipelineLive
                         'end' => $end,
                         'text' => $transcription['text'],
                     ];
+                    fwrite(STDERR, sprintf(
+                        "[%s - %s] chunk-%06d: %s\n",
+                        self::formatTime($start),
+                        self::formatTime($end),
+                        $sequence,
+                        $transcription['text'],
+                    ));
+                    fflush(STDERR);
                     return;
                 } catch (\Throwable $error) {
                     $metrics->addStageTime('stt', (microtime(true) - $started) * 1000);

@@ -59,7 +59,7 @@ if (isset($opts['help']) || $files === []) {
 $http = new HttpClient();
 $serviceUrl = Config::env('WHISPER_URL', 'http://127.0.0.1:8000');
 $whisper = new WhisperClient($http, $serviceUrl);
-$llm = new Gemini(Config::env('GEMINI_API_KEY'), dirname(__DIR__) . '/skills/skill.md', Config::env('GEMINI_MODEL', 'gemini-1.5-flash'));
+$llm = new Gemini(Config::env('GEMINI_API_KEY'), dirname(__DIR__) . '/skills/skill.md', Config::env('GEMINI_MODEL', 'gemini-3.1-flash-lite'));
 $metrics = new Metrics();
 $retries = (int) ($opts['retries'] ?? 2);
 if (isset($opts['live'])) {
