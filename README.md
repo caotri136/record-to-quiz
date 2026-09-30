@@ -163,7 +163,7 @@ without displaying its value:
 test -n "$GEMINI_API_KEY" && echo "Gemini key is set"
 ```
 
-The CLI defaults to Gemini model `gemini-1.5-flash`. The optional
+The CLI defaults to Gemini model `gemini-3.1-flash-lite`. The optional
 `GEMINI_MODEL` environment variable can override it.
 
 ## 8. Run upload mode
@@ -214,7 +214,10 @@ generation. FFmpeg must remain installed and available in WSL.
 
 Metrics include stage timings for VAD, STT, and LLM, along with retries,
 success/failure counts, Gemini API calls, and token usage when returned by the
-API. To calculate estimated Gemini cost, set both model-appropriate rates:
+API. `started_at` and `finished_at` are ISO-8601 timestamps; their Unix values
+are available in `started_at_epoch` and `finished_at_epoch`. The
+`processing_time_seconds` object reports STT, Gemini, and total processing time.
+To calculate estimated Gemini cost, set both model-appropriate rates:
 
 ```bash
 export GEMINI_INPUT_USD_PER_MILLION='YOUR_INPUT_RATE'
