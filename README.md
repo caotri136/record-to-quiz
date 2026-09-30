@@ -166,6 +166,9 @@ test -n "$GEMINI_API_KEY" && echo "Gemini key is set"
 The CLI defaults to Gemini model `gemini-3.1-flash-lite`. The optional
 `GEMINI_MODEL` environment variable can override it.
 
+## 7.5 Preparing audio
+Create directory /recordings in the root one, then paste your audio in that folder and rename it to "sample". Make suẻ that your file type is wav
+
 ## 8. Run upload mode
 
 In the second Ubuntu terminal:
